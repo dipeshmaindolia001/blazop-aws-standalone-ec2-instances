@@ -1,0 +1,119 @@
+name: Terraform Request
+
+# Triggered by the CONFIG repo's submit_terraform_request.yml via repository_dispatch.
+# client_payload: request_number, config_repo, config_ref, action (plan|apply), dry_run (bool)
+
+on:
+  repository_dispatch:
+    types: [terraform-request]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terraform-${{ github.event.client_payload.request_number }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  TF_IN_AUTOMATION: "true"
+  VAR_FILE: terraform.tfvars.json      # file committed by BlaZop var_file step
+  DEPLOYMENT_FILE: deployment.json     # file committed by BlaZop deployment_file step
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+    env:
+      REQUEST_NUMBER: ${{ github.event.client_payload.request_number }}
+      CONFIG_REPO: ${{ github.event.client_payload.config_repo }}
+      CONFIG_REF: ${{ github.event.client_payload.config_ref }}
+      ACTION: ${{ github.event.client_payload.action }}
+      DRY_RUN: ${{ github.event.client_payload.dry_run }}
+
+    steps:
+      - name: Validate payload
+        run: |
+          echo "request_number=$REQUEST_NUMBER config_repo=$CONFIG_REPO config_ref=$CONFIG_REF action=$ACTION dry_run=$DRY_RUN"
+          [[ "$REQUEST_NUMBER" =~ ^RITM[0-9]{7}$ ]] || { echo "::error::Invalid request_number '$REQUEST_NUMBER'"; exit 1; }
+          [[ "$ACTION" == "plan" || "$ACTION" == "apply" ]] || { echo "::error::Invalid action '$ACTION'"; exit 1; }
+          [[ -n "$CONFIG_REPO" && -n "$CONFIG_REF" ]] || { echo "::error::config_repo/config_ref missing"; exit 1; }
+
+      - name: Checkout code repo
+        uses: actions/checkout@v4
+        with:
+          path: code
+
+      - name: Checkout config repo (request branch)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CONFIG_REPO }}
+          ref: ${{ env.CONFIG_REF }}
+          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          path: config
+
+      - name: Resolve template from deployment file
+        id: tpl
+        run: |
+          test -f "config/$DEPLOYMENT_FILE" || { echo "::error::$DEPLOYMENT_FILE not found on $CONFIG_REF"; exit 1; }
+          test -f "config/$VAR_FILE"        || { echo "::error::$VAR_FILE not found on $CONFIG_REF"; exit 1; }
+          TEMPLATE=$(jq -r '.template // empty' "config/$DEPLOYMENT_FILE")
+          VERSION=$(jq -r '.terraform_code_version // empty' "config/$DEPLOYMENT_FILE")
+          [ -n "$TEMPLATE" ] || { echo "::error::'template' is empty in $DEPLOYMENT_FILE"; exit 1; }
+          [ -d "code/templates/$TEMPLATE" ] || { echo "::error::Unknown template '$TEMPLATE' (no code/templates/$TEMPLATE)"; exit 1; }
+          echo "template=$TEMPLATE" >> "$GITHUB_OUTPUT"
+          echo "dir=code/templates/$TEMPLATE" >> "$GITHUB_OUTPUT"
+          echo "Template: $TEMPLATE  Code version: $VERSION"
+          echo "---- $VAR_FILE ----"; cat "config/$VAR_FILE"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform init
+        working-directory: ${{ steps.tpl.outputs.dir }}
+        run: terraform init -input=false
+
+      - name: Terraform validate
+        working-directory: ${{ steps.tpl.outputs.dir }}
+        run: terraform validate
+
+      - name: Terraform plan
+        working-directory: ${{ steps.tpl.outputs.dir }}
+        run: |
+          terraform plan -input=false -no-color \
+            -var-file="$GITHUB_WORKSPACE/config/$VAR_FILE" \
+            -var="aws_region=$AWS_REGION" \
+            -var="request_number=$REQUEST_NUMBER" \
+            -out=tfplan | tee plan.txt
+
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: plan-${{ env.REQUEST_NUMBER }}
+          path: ${{ steps.tpl.outputs.dir }}/plan.txt
+
+      - name: Terraform apply
+        if: env.ACTION == 'apply' && env.DRY_RUN != 'true'
+        working-directory: ${{ steps.tpl.outputs.dir }}
+        run: |
+          echo "::warning::Simulation uses local state. State is lost after this run (no automatic destroy)."
+          terraform apply -input=false -auto-approve tfplan
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Terraform request $REQUEST_NUMBER"
+            echo "| key | value |"; echo "|---|---|"
+            echo "| config | $CONFIG_REPO@$CONFIG_REF |"
+            echo "| template | ${{ steps.tpl.outputs.template }} |"
+            echo "| action | $ACTION |"
+            echo "| dry_run | $DRY_RUN |"
+            if [[ "$ACTION" == "apply" && "$DRY_RUN" != "true" ]]; then echo "| applied | yes |"; else echo "| applied | no (plan only) |"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
